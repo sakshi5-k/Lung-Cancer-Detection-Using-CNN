@@ -1,0 +1,511 @@
+# ui_injector.py
+"""
+ui_injector.py
+
+- Dark-teal dashboard with a dim, semi-transparent abstract lung-themed background (embedded URL).
+- Login (fixed username/password), persistent reminders, emoji-rich 10-question quiz (text + image if available).
+- Imports and runs your original app.py (unchanged) after successful login — BUT only if any uploaded image is validated as being part of the dataset.
+- Uses a safe rerun wrapper to support different Streamlit versions.
+- Strict validation: uploaded images must match a dataset image's SHA-256 hash, otherwise they are rejected and app.py is not imported.
+"""
+
+import streamlit as st
+from pathlib import Path
+import json
+import time
+import importlib
+import sys
+import random
+import base64
+import hashlib
+import os
+
+# -----------------------
+# Config
+# -----------------------
+BASE = Path(__file__).parent
+STATIC = BASE / "static"
+DATA_DIRS = [BASE / "data", STATIC, BASE]  # places to find images for quiz and dataset
+REMINDERS_FILE = BASE / "reminders.json"
+CREDENTIALS = {"username": "admin", "password": "1234"}
+QUIZ_QUESTION_COUNT = 10  # simplified to 10
+
+# Embedded abstract lung-themed background image (teal gradients / minimal)
+BACKGROUND_URL = (
+    "https://images.unsplash.com/photo-1526256262350-7da7584cf5eb"
+    "?ixlib=rb-4.0.3&auto=format&fit=crop&w=1470&q=60"
+)
+
+# dataset hashes cache file
+DATASET_HASH_INDEX = BASE / "data" / "dataset_hashes.json"
+
+# ensure reminders file exists
+if not REMINDERS_FILE.exists():
+    REMINDERS_FILE.write_text("[]", encoding="utf-8")
+
+# ensure uploads dir exists
+( BASE / "uploads" ).mkdir(parents=True, exist_ok=True)
+
+# -----------------------
+# Compatibility: safe rerun (works across Streamlit versions)
+# -----------------------
+def safe_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()  # older streamlit
+        except Exception:
+            pass  # best-effort
+
+# -----------------------
+# Utilities: reminders
+# -----------------------
+def load_reminders():
+    try:
+        return json.loads(REMINDERS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+def save_reminders(reminders):
+    REMINDERS_FILE.write_text(json.dumps(reminders, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def add_reminder(text, date_str):
+    r = load_reminders()
+    r.append({"id": int(time.time() * 1000), "text": text, "date": date_str})
+    save_reminders(r)
+
+def delete_reminder(rem_id):
+    r = load_reminders()
+    r = [x for x in r if x.get("id") != rem_id]
+    save_reminders(r)
+
+# -----------------------
+# Helpers: CSS and background styling
+# -----------------------
+def inline_custom_css():
+    css = f"""
+    <style>
+    .stApp {{
+      background-image: url('{BACKGROUND_URL}');
+      background-size: cover;
+      background-position: center;
+      background-attachment: fixed;
+      background-color: rgba(3, 20, 25, 0.65);
+      background-blend-mode: multiply;
+    }}
+    .dashboard-card {{
+      background: rgba(12, 20, 25, 0.78);
+      border-radius: 12px;
+      padding: 18px;
+      box-shadow: 0 6px 30px rgba(0,0,0,0.6);
+      color: #e6f7f8;
+      border: 1px solid rgba(50,200,180,0.08);
+    }}
+    .dashboard-header {{
+      display:flex; justify-content:space-between; align-items:center;
+      padding: 8px 12px; margin-bottom: 12px; color: #e6f7f8;
+    }}
+    .brand {{ font-size:20px; font-weight:700; color: #8ff0d8; letter-spacing: .6px; }}
+    .subtle {{ color: #bfeeea; opacity: .9; font-size:13px; }}
+    .card {{
+      background: linear-gradient(180deg, rgba(10,16,18,0.9), rgba(6,12,14,0.82));
+      border-radius: 10px; padding: 12px; margin-bottom: 12px;
+      border: 1px solid rgba(60,200,180,0.06);
+    }}
+    .reminder-card {{ border-left: 4px solid #00c2a8; padding-left: 10px; margin-bottom: 8px; }}
+    .muted {{ color: #9fded0; font-size:13px; opacity:.9; }}
+    .footer {{ text-align:center; font-size:12px; color:#9fded0; opacity:.85; padding-top:10px; }}
+    img.quiz-img {{
+      filter: saturate(0.9) contrast(1.02);
+      border-radius:8px; border: 1px solid rgba(255,255,255,0.05); max-width: 380px;
+    }}
+    </style>
+    """
+    static_css = ""
+    if STATIC.exists():
+        for p in sorted(STATIC.rglob("*.css")):
+            try:
+                static_css += "\n/* " + p.name + " */\n" + p.read_text(encoding="utf-8")
+            except Exception:
+                pass
+    if static_css:
+        css += f"\n<style>{static_css}</style>"
+    st.markdown(css, unsafe_allow_html=True)
+
+# -----------------------
+# Helpers: find images for quiz
+# -----------------------
+def collect_images(limit=10):
+    imgs = []
+    exts = [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+    for base in DATA_DIRS:
+        if not base.exists():
+            continue
+        for p in base.rglob("*"):
+            if p.suffix.lower() in exts:
+                imgs.append(p)
+                if len(imgs) >= limit:
+                    return imgs
+    return imgs
+
+def img_to_data_uri(path: Path):
+    try:
+        b = path.read_bytes()
+        ext = path.suffix.lower().replace(".", "")
+        return f"data:image/{ext};base64," + base64.b64encode(b).decode("utf-8")
+    except Exception:
+        return None
+
+# -----------------------
+# Dataset Hash Index (strict validation)
+# -----------------------
+def sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
+
+def build_dataset_hash_index(rebuild=False):
+    """
+    Scan DATA_DIRS for image files and write a json of {filename:sha256} for fast validation.
+    If dataset_hashes.json exists and rebuild=False, it will be loaded instead.
+    """
+    # try load cached index
+    if DATASET_HASH_INDEX.exists() and not rebuild:
+        try:
+            raw = DATASET_HASH_INDEX.read_text(encoding="utf-8")
+            index = json.loads(raw)
+            # return {filename:hash}
+            return index
+        except Exception:
+            # fallback to rebuilding
+            pass
+
+    index = {}
+    exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+    for base in DATA_DIRS:
+        if not base.exists():
+            continue
+        for p in base.rglob("*"):
+            if p.suffix.lower() in exts and p.is_file():
+                try:
+                    b = p.read_bytes()
+                    index[str(p.name)] = sha256_bytes(b)
+                except Exception:
+                    continue
+    try:
+        DATASET_HASH_INDEX.parent.mkdir(parents=True, exist_ok=True)
+        DATASET_HASH_INDEX.write_text(json.dumps(index, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return index
+
+# build index at import time (fast enough for moderate datasets)
+DATASET_HASHES = build_dataset_hash_index()
+DATASET_HASH_SET = set(DATASET_HASHES.values())
+DATASET_FILENAMES = set(DATASET_HASHES.keys())
+
+def validate_upload_bytes(file_bytes: bytes) -> bool:
+    """Return True if file_bytes match any dataset image hash."""
+    return sha256_bytes(file_bytes) in DATASET_HASH_SET
+
+# -----------------------
+# Quiz: prepare questions (~10, simpler)
+# -----------------------
+def make_quiz_questions():
+    bank = [
+        {"q":"Which scan is best for lung nodule detection?","options":["🩻 CT scan","🧲 MRI","🔊 Ultrasound","🦴 Knee X-ray"],"answer":0},
+        {"q":"What does 'malignant' mean?","options":["✅ Cancerous","❌ Non-cancerous","⚠️ Inflamed","🟦 Benign"],"answer":0},
+        {"q":"A small round opacity in the lung is called a _____.","options":["🪙 Coin lesion","⭐ Star lesion","🌊 Wave","🧊 Cube"],"answer":0},
+        {"q":"Which habit greatly increases lung cancer risk?","options":["🚬 Smoking","🥗 Eating salad","🏃 Exercise","💧 Drinking water"],"answer":0},
+        {"q":"Common symptom to watch for:","options":["💨 Persistent cough","👂 Ear pain","🦵 Leg cramp","👃 Sneezing"],"answer":0},
+        {"q":"Next step for a suspicious CT nodule:","options":["🩺 Biopsy/PET-CT","🙈 Ignore it","💊 Random antibiotics","🦴 Bone scan"],"answer":0},
+        {"q":"CNN stands for:","options":["🧠 Convolutional Neural Network","Central Node Network","Channel Normalization Node","Conditional Normal Net"],"answer":0},
+        {"q":"Which is benign?","options":["🌱 Hamartoma","🔥 Small cell carcinoma","🧬 Adenocarcinoma","🌍 Metastasis"],"answer":0},
+        {"q":"Default local Streamlit port is:","options":["🔌 8501","🔌 5000","🔌 3000","🔌 8080"],"answer":0},
+        {"q":"Purpose of crop_and_classify():","options":["✂️ Crop ROIs & classify","🌐 Run web server","📦 Zip files","🧪 Train YOLO"],"answer":0},
+    ]
+
+    # attach a few local images if available
+    imgs = collect_images(limit=4)
+    if imgs:
+        slots = random.sample(range(len(bank)), min(len(imgs), 4))
+        for i, idx in enumerate(slots):
+            uri = img_to_data_uri(imgs[i])
+            if uri:
+                bank[idx]["image"] = uri
+
+    # ensure exactly QUIZ_QUESTION_COUNT items (already 10, but keep for safety)
+    return bank[:QUIZ_QUESTION_COUNT]
+
+# -----------------------
+# UI: Login
+# -----------------------
+def show_login():
+    st.markdown("<div class='dashboard-card' style='max-width:640px; margin:auto;'>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#7ff3d6; margin-bottom:6px;'>🔐 Login</h2>", unsafe_allow_html=True)
+    with st.form("login_form"):
+        user = st.text_input("Username")
+        pwd = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in")
+        if submitted:
+            if user == CREDENTIALS["username"] and pwd == CREDENTIALS["password"]:
+                st.session_state["logged_in"] = True
+                st.success("✅ Logged in")
+                safe_rerun()
+            else:
+                st.error("Invalid credentials. Try again.")
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("<div class='muted' style='text-align:center; margin-top:8px;'>Use username <b>admin</b> & password <b>1234</b></div>", unsafe_allow_html=True)
+
+# -----------------------
+# UI: Reminders (sidebar)
+# -----------------------
+def show_reminders_sidebar():
+    st.sidebar.markdown("<div class='card' style='padding:10px;'>", unsafe_allow_html=True)
+    st.sidebar.markdown("## 🗓️ Daily Reminders")
+    with st.sidebar.form("rem_form", clear_on_submit=True):
+        rtext = st.text_input("Reminder text", placeholder="e.g. Review scans, take meds...")
+        rdate = st.date_input("Date")
+        add = st.form_submit_button("Add")
+        if add and rtext:
+            add_reminder(rtext, rdate.isoformat())
+            st.success("Saved reminder")
+            safe_rerun()
+
+    rems = load_reminders()
+    st.sidebar.markdown("---")
+    if rems:
+        for r in sorted(rems, key=lambda x: x.get("date","")):
+            st.sidebar.markdown(
+                f"<div class='reminder-card'>{r.get('text')}<br/><span class='muted'>📅 {r.get('date')}</span></div>",
+                unsafe_allow_html=True
+            )
+            if st.sidebar.button("Delete", key=f"del_{r.get('id')}"):
+                delete_reminder(r.get("id"))
+                safe_rerun()
+    else:
+        st.sidebar.info("No reminders yet.")
+    st.sidebar.markdown("</div>", unsafe_allow_html=True)
+
+# -----------------------
+# UI: Quiz (fixed answer handling, 10 Q)
+# -----------------------
+def show_quiz():
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("<h3 style='color:#8ff0d8;'>🧠 Knowledge Quiz (10)</h3>", unsafe_allow_html=True)
+
+    if "quiz_state" not in st.session_state:
+        st.session_state.quiz_state = {
+            "questions": make_quiz_questions(),
+            "current": 0,
+            "answers": {},   # {q_index: option_index}
+            "finished": False,
+            "score": None
+        }
+
+    qs = st.session_state.quiz_state["questions"]
+    cur = st.session_state.quiz_state["current"]
+    q = qs[cur]
+
+    st.markdown(f"**Question {cur+1} / {len(qs)}**")
+    st.markdown(f"### {q['q']}")
+
+    if q.get("image"):
+        st.markdown(f'<img class="quiz-img" src="{q["image"]}" alt="quiz image"/>', unsafe_allow_html=True)
+
+    # Persist radio selection based on saved answers; default to 0 only if not answered yet
+    prev_idx = st.session_state.quiz_state["answers"].get(cur, 0)
+    choice_label = st.radio(
+        " ",
+        q["options"],
+        index=prev_idx,
+        key=f"opt_{cur}",
+        label_visibility="collapsed",
+    )
+
+    # ✅ Save the answer immediately (no Submit button needed)
+    selected_index = q["options"].index(choice_label)
+    st.session_state.quiz_state["answers"][cur] = selected_index
+
+    col1, col2, col3 = st.columns([1,1,6])
+    if col1.button("Prev") and cur > 0:
+        st.session_state.quiz_state["current"] = cur - 1
+        safe_rerun()
+    if col2.button("Next") and cur < len(qs) - 1:
+        st.session_state.quiz_state["current"] = cur + 1
+        safe_rerun()
+    if col3.button("Finish Quiz"):
+        answers = st.session_state.quiz_state["answers"]
+        score = sum(1 for i, qq in enumerate(qs) if answers.get(i) == qq["answer"])
+        st.session_state.quiz_state["finished"] = True
+        st.session_state.quiz_state["score"] = score
+        safe_rerun()
+
+    if st.session_state.quiz_state["finished"]:
+        sc = st.session_state.quiz_state["score"]
+        pct = int((sc / len(qs)) * 100)
+        st.markdown(f"### 🏆 Your Score: {sc} / {len(qs)}  —  {pct}%")
+        if pct >= 80:
+            st.success("Excellent! 🎉")
+        elif pct >= 50:
+            st.info("Good job — room to improve 👍")
+        else:
+            st.warning("Keep studying — you got this 💪")
+        if st.button("Retake Quiz"):
+            st.session_state.quiz_state = {
+                "questions": make_quiz_questions(),
+                "current": 0,
+                "answers": {},
+                "finished": False,
+                "score": None
+            }
+            safe_rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# -----------------------
+# Uploader with strict validation
+# -----------------------
+def show_protected_uploader():
+    """
+    Show uploader that only accepts images whose bytes match a dataset image (exact match).
+    If the upload is invalid, the rest of the app (import/app) will be blocked.
+    """
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("<h4 style='color:#8ff0d8;'>🔒 Protected Image Upload</h4>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='muted'>Upload only images that are part of the approved dataset. "
+        "Uploads that do not match dataset files will be rejected and the prediction UI will not run.</div>",
+        unsafe_allow_html=True,
+    )
+
+    uploaded = st.file_uploader("Upload image (dataset-only)", type=["png","jpg","jpeg","webp","gif"])
+    if uploaded is not None:
+        data = uploaded.read()
+        # quick filename check for nicer feedback
+        if uploaded.name not in DATASET_FILENAMES:
+            # still check bytes (someone could rename to a dataset filename)
+            if validate_upload_bytes(data):
+                st.success("✅ Uploaded image bytes match a dataset file (allowed).")
+                save_valid_upload(uploaded, data)
+                st.session_state["upload_valid"] = True
+                st.session_state["uploaded_valid_name"] = uploaded.name
+            else:
+                st.session_state["upload_valid"] = False
+                st.session_state["uploaded_valid_name"] = None
+                st.error("❌ This image is NOT recognized as a dataset image — import/prediction UI blocked.")
+        else:
+            # filename matches one in dataset — still verify bytes to be safe
+            if validate_upload_bytes(data):
+                st.success("✅ Uploaded image bytes match a dataset file (allowed).")
+                save_valid_upload(uploaded, data)
+                st.session_state["upload_valid"] = True
+                st.session_state["uploaded_valid_name"] = uploaded.name
+            else:
+                # if filename matches but bytes don't, reject
+                st.session_state["upload_valid"] = False
+                st.session_state["uploaded_valid_name"] = None
+                st.error("❌ Filename matches dataset but file bytes differ — rejected.")
+
+        # provide small hint about dataset filenames
+        if DATASET_FILENAMES:
+            sample = ", ".join(list(DATASET_FILENAMES)[:6])
+            st.markdown(f"<div class='muted' style='margin-top:8px;'>Dataset filenames (examples): <code>{sample}</code></div>", unsafe_allow_html=True)
+
+    else:
+        # no upload provided: behave as 'no external image' (allowed)
+        st.markdown("<div class='muted'>No upload provided — app will run using its usual dataset/default behavior.</div>", unsafe_allow_html=True)
+        st.session_state.setdefault("upload_valid", True)
+        st.session_state.setdefault("uploaded_valid_name", None)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+def save_valid_upload(uploaded_streamlit_file, data_bytes: bytes):
+    """Save validated upload into BASE/uploads and put path in session_state for app.py to use."""
+    updir = BASE / "uploads"
+    updir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(uploaded_streamlit_file.name).name
+    outp = updir / safe_name
+    try:
+        outp.write_bytes(data_bytes)
+        st.session_state["uploaded_valid_path"] = str(outp)
+    except Exception as e:
+        st.warning(f"Could not save uploaded file to {outp}: {e}")
+
+# -----------------------
+# Dashboard shell + import original app
+# -----------------------
+def run_dashboard():
+    st.set_page_config(page_title="Lung Cancer Dashboard", layout="wide")
+    inline_custom_css()
+
+    st.markdown(
+        "<div class='dashboard-header'>"
+        "<div class='brand'>🫁 LUNG AI</div>"
+        "<div class='subtle'>Lung Cancer CT Detection & Classification</div>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+    left, right = st.columns([3, 1])
+    with left:
+        st.markdown("<div class='dashboard-card'>", unsafe_allow_html=True)
+
+        # Protected uploader appears above the prediction UI.
+        show_protected_uploader()
+
+        # Only import app.py if upload is valid (or no upload). This prevents non-dataset images
+        # from being used — app.py will not be loaded if an invalid upload exists.
+        upload_ok = st.session_state.get("upload_valid", True)
+
+        try:
+            if not upload_ok:
+                st.error("⚠️ Upload failed validation — prediction UI is blocked until a dataset image is uploaded or the upload is removed.")
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                # Safe to import app.py
+                if "app" in sys.modules:
+                    importlib.reload(sys.modules["app"])
+                else:
+                    import app  # noqa: F401
+                st.markdown("</div>", unsafe_allow_html=True)
+        except Exception as e:
+            st.error("Failed to import app.py (prediction UI). See details below.")
+            st.exception(e)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        show_quiz()
+
+    with right:
+        st.markdown("<div class='card' style='padding:10px;'>", unsafe_allow_html=True)
+        st.markdown("### 🗒️ Reminders")
+        show_reminders_sidebar()
+        st.markdown("---")
+        st.markdown("### 💡 Quick Tips")
+        st.markdown(
+            "<ul style='color:#bfeeea'>"
+            "<li>Upload clear CT scans</li>"
+            "<li>Use YOLO for detection</li>"
+            "<li>Choose CNN for classification</li>"
+            "</ul>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='footer'>Built with ❤️ — keep patient data private</div>", unsafe_allow_html=True)
+
+# -----------------------
+# Entry point
+# -----------------------
+def main():
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+
+    if not st.session_state.logged_in:
+        show_login()
+    else:
+        run_dashboard()
+
+if __name__ == "__main__":
+    main()
